@@ -500,7 +500,7 @@
     mode = 'local';
     myColor = null;
     roomBadge.style.display = 'none';
-    leaveRoomBtn.style.display = 'none';
+    leaveRoomBtn.style.display = 'inline-block';
     passBtn.onclick = () => {
       switchTurnLocal();
       renderFromLocalState();
@@ -709,6 +709,22 @@
     const { black, white } = countDiscs(board);
     gameOver = false;
 
+    // 相手の離脱チェック
+    const opponentColor = myColor === BLACK ? 'white' : 'black';
+    const opponentPresent = state.players && state.players[opponentColor];
+    if (!opponentPresent && !gameOver) {
+      passBtn.style.display = 'none';
+      messageBanner.textContent = '相手が対局から離脱しました。ロビーに戻ってください。';
+      renderBoard({
+        board, currentPlayer, gameOver: true,
+        moves: [],
+        lastMove: state.lastMove,
+        onCellClick: () => {},
+        interactive: false
+      });
+      return;
+    }
+
     if (moves.length === 0) {
       const opponent = currentPlayer === BLACK ? WHITE : BLACK;
       if (legalMoves(board, opponent).length === 0) {
@@ -787,7 +803,12 @@
     }
   }
 
-  function leaveToLobby() {
+  async function leaveToLobby() {
+    if (mode === 'online' && roomCode && myColor !== null) {
+      const fb = await waitForFirebase();
+      const myKey = myColor === BLACK ? 'black' : 'white';
+      fb.set(fb.ref(fb.db, 'rooms/' + roomCode + '/players/' + myKey), false).catch(() => {});
+    }
     if (unsubscribe) { unsubscribe(); unsubscribe = null; }
     mode = null;
     myColor = null;
