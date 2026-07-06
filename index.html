@@ -335,6 +335,13 @@
       </div>
       <div id="lobbyMessage" class="lobby-message"></div>
     </div>
+    <div class="lobby-card">
+      <h2>CPU対戦</h2>
+      <p>あなたは黒番です。3段階の強さから選べます。</p>
+      <button id="cpuEasyBtn">弱い(ランダム)</button>
+      <button id="cpuMediumBtn">中(2手先読み)</button>
+      <button id="cpuHardBtn">強い(4手先読み+戦略評価)</button>
+    </div>
   </div>
 
   <!-- 部屋待機画面 -->
@@ -397,8 +404,11 @@
 
   // ---- ゲーム状態 ----
   let board, currentPlayer, gameOver;
-  let mode = null;            // 'local' | 'online'
+  let mode = null;            // 'local' | 'online' | 'cpu'
   let myColor = null;         // BLACK | WHITE (online時のみ)
+  let cpuLevel = null;        // 1 | 2 | 3
+  let humanColor = null;
+  let cpuColor = null;
   let roomCode = null;
   let roomRef = null;
   let unsubscribe = null;
@@ -410,6 +420,9 @@
   const subtitleText = document.getElementById('subtitleText');
 
   const startLocalBtn = document.getElementById('startLocalBtn');
+  const cpuEasyBtn = document.getElementById('cpuEasyBtn');
+  const cpuMediumBtn = document.getElementById('cpuMediumBtn');
+  const cpuHardBtn = document.getElementById('cpuHardBtn');
   const createRoomBtn = document.getElementById('createRoomBtn');
   const joinRoomBtn = document.getElementById('joinRoomBtn');
   const joinCodeInput = document.getElementById('joinCodeInput');
@@ -506,7 +519,6 @@
       renderFromLocalState();
     };
     document.getElementById('resetBtn').onclick = () => initLocalBoard();
-    document.getElementById('playAgainBtn').onclick = () => initLocalBoard();
     initLocalBoard();
     showScreen('game');
   }
@@ -561,6 +573,213 @@
     } else {
       passBtn.style.display = 'none';
       messageBanner.textContent = '\u00A0';
+    }
+  }
+
+  // ---- CPU対戦 ----
+  const WEIGHTS = [
+    [120, -20, 20,  5,  5, 20, -20, 120],
+    [-20, -40, -5, -5, -5, -5, -40, -20],
+    [ 20,  -5, 15,  3,  3, 15,  -5,  20],
+    [  5,  -5,  3,  3,  3,  3,  -5,   5],
+    [  5,  -5,  3,  3,  3,  3,  -5,   5],
+    [ 20,  -5, 15,  3,  3, 15,  -5,  20],
+    [-20, -40, -5, -5, -5, -5, -40, -20],
+    [120, -20, 20,  5,  5, 20, -20, 120]
+  ];
+
+  function countEmptyCells(b) {
+    let e = 0;
+    for (let r = 0; r < SIZE; r++)
+      for (let c = 0; c < SIZE; c++)
+        if (b[r][c] === EMPTY) e++;
+    return e;
+  }
+
+  // レベル2用:単純な石数差のみで評価(浅い読み)
+  function evalSimple(b, color) {
+    const { black, white } = countDiscs(b);
+    return color === BLACK ? black - white : white - black;
+  }
+
+  // レベル3用:角の位置価値+着手可能数の差で評価(戦略的)
+  function evalAdvanced(b, color) {
+    const opp = color === BLACK ? WHITE : BLACK;
+    let posScore = 0;
+    for (let r = 0; r < SIZE; r++) {
+      for (let c = 0; c < SIZE; c++) {
+        if (b[r][c] === color) posScore += WEIGHTS[r][c];
+        else if (b[r][c] === opp) posScore -= WEIGHTS[r][c];
+      }
+    }
+    const myMoves = legalMoves(b, color).length;
+    const oppMoves = legalMoves(b, opp).length;
+    const mobilityScore = (myMoves - oppMoves) * 8;
+    return posScore + mobilityScore;
+  }
+
+  // αβ枝刈り付きミニマックス。maximizingColor視点でのスコアを返す
+  function minimax(b, color, depth, alpha, beta, maximizingColor, evalFn) {
+    const moves = legalMoves(b, color);
+    const opp = color === BLACK ? WHITE : BLACK;
+
+    if (moves.length === 0) {
+      const oppMoves = legalMoves(b, opp);
+      if (oppMoves.length === 0) {
+        // 終局:最終的な石数差を強く評価に反映
+        const { black, white } = countDiscs(b);
+        const diff = maximizingColor === BLACK ? black - white : white - black;
+        return diff * 1000;
+      }
+      // 合法手なし→パスして相手番へ(深さは消費するが手番は変わらない扱い)
+      return minimax(b, opp, depth - 1, alpha, beta, maximizingColor, evalFn);
+    }
+
+    if (depth === 0) {
+      return evalFn(b, maximizingColor);
+    }
+
+    const isMaximizing = color === maximizingColor;
+    let best = isMaximizing ? -Infinity : Infinity;
+    for (const move of moves) {
+      const nb = b.map(row => row.slice());
+      applyMove(nb, move, color);
+      const val = minimax(nb, opp, depth - 1, alpha, beta, maximizingColor, evalFn);
+      if (isMaximizing) {
+        best = Math.max(best, val);
+        alpha = Math.max(alpha, best);
+      } else {
+        best = Math.min(best, val);
+        beta = Math.min(beta, best);
+      }
+      if (beta <= alpha) break;
+    }
+    return best;
+  }
+
+  function chooseCPUMove(b, color, level, moves) {
+    if (level === 1) {
+      return moves[Math.floor(Math.random() * moves.length)];
+    }
+
+    let depth, evalFn;
+    if (level === 2) {
+      depth = 2;
+      evalFn = evalSimple;
+    } else {
+      const empty = countEmptyCells(b);
+      depth = empty <= 10 ? empty : 4; // 終盤は最後まで読み切る
+      evalFn = evalAdvanced;
+    }
+
+    const opp = color === BLACK ? WHITE : BLACK;
+    let bestMove = moves[0];
+    let bestVal = -Infinity;
+    for (const move of moves) {
+      const nb = b.map(row => row.slice());
+      applyMove(nb, move, color);
+      const val = minimax(nb, opp, depth - 1, -Infinity, Infinity, color, evalFn);
+      if (val > bestVal) {
+        bestVal = val;
+        bestMove = move;
+      }
+    }
+    return bestMove;
+  }
+
+  function startCPU(level) {
+    mode = 'cpu';
+    cpuLevel = level;
+    humanColor = BLACK;
+    cpuColor = WHITE;
+    myColor = null;
+    roomBadge.style.display = 'none';
+    leaveRoomBtn.style.display = 'inline-block';
+    passBtn.style.display = 'none';
+    document.getElementById('resetBtn').style.display = 'inline-block';
+    document.getElementById('resetBtn').onclick = () => initCPUBoard();
+    initCPUBoard();
+    showScreen('game');
+  }
+
+  function initCPUBoard() {
+    board = freshBoard();
+    currentPlayer = BLACK;
+    gameOver = false;
+    overlay.classList.remove('show');
+    renderCPUState();
+  }
+
+  function handleCPUCellClick(r, c, moves) {
+    if (gameOver || currentPlayer !== humanColor) return;
+    const move = moves.find(m => m.r === r && m.c === c);
+    if (!move) return;
+    applyMove(board, move, humanColor);
+    renderBoard({
+      board, currentPlayer, gameOver: false,
+      moves: [], lastMove: move,
+      onCellClick: () => {}, interactive: false
+    });
+    setTimeout(() => {
+      switchTurnLocal();
+      renderCPUState();
+    }, 450);
+  }
+
+  function cpuTakeTurn(moves) {
+    const move = chooseCPUMove(board, cpuColor, cpuLevel, moves);
+    applyMove(board, move, cpuColor);
+    renderBoard({
+      board, currentPlayer, gameOver: false,
+      moves: [], lastMove: move,
+      onCellClick: () => {}, interactive: false
+    });
+    setTimeout(() => {
+      switchTurnLocal();
+      renderCPUState();
+    }, 450);
+  }
+
+  function renderCPUState(lastMove) {
+    if (gameOver) return;
+    const moves = legalMoves(board, currentPlayer);
+
+    if (moves.length === 0) {
+      const opponent = currentPlayer === BLACK ? WHITE : BLACK;
+      if (legalMoves(board, opponent).length === 0) {
+        endGame(board);
+        renderBoard({
+          board, currentPlayer, gameOver: true,
+          moves: [], lastMove,
+          onCellClick: () => {}, interactive: false
+        });
+        return;
+      }
+      messageBanner.textContent = (currentPlayer === BLACK ? '黒' : '白') + 'は合法手がないためパスです';
+      renderBoard({
+        board, currentPlayer, gameOver: false,
+        moves: [], lastMove,
+        onCellClick: () => {}, interactive: false
+      });
+      setTimeout(() => {
+        switchTurnLocal();
+        renderCPUState();
+      }, 900);
+      return;
+    }
+
+    const interactiveNow = currentPlayer === humanColor;
+    messageBanner.textContent = interactiveNow ? 'あなたの番です' : 'CPU思考中…';
+    renderBoard({
+      board, currentPlayer, gameOver: false,
+      moves: interactiveNow ? moves : [],
+      lastMove,
+      onCellClick: handleCPUCellClick,
+      interactive: interactiveNow
+    });
+
+    if (!interactiveNow) {
+      setTimeout(() => cpuTakeTurn(moves), 500);
     }
   }
 
@@ -832,12 +1051,16 @@
 
   // ---- イベント登録 ----
   startLocalBtn.addEventListener('click', startLocal);
+  cpuEasyBtn.addEventListener('click', () => startCPU(1));
+  cpuMediumBtn.addEventListener('click', () => startCPU(2));
+  cpuHardBtn.addEventListener('click', () => startCPU(3));
   createRoomBtn.addEventListener('click', createRoom);
   joinRoomBtn.addEventListener('click', joinRoom);
   cancelRoomBtn.addEventListener('click', cancelRoom);
   leaveRoomBtn.addEventListener('click', leaveToLobby);
   document.getElementById('playAgainBtn').addEventListener('click', () => {
     if (mode === 'local') { initLocalBoard(); }
+    else if (mode === 'cpu') { initCPUBoard(); }
     else { leaveToLobby(); }
   });
 
