@@ -569,6 +569,16 @@
     return String(Math.floor(100000 + Math.random() * 900000));
   }
 
+  async function generateUniqueRoomCode(fb) {
+    const MAX_ATTEMPTS = 10;
+    for (let i = 0; i < MAX_ATTEMPTS; i++) {
+      const code = genRoomCode();
+      const snap = await fb.get(fb.ref(fb.db, 'rooms/' + code));
+      if (!snap.exists()) return code;
+    }
+    throw new Error('部屋コードの生成に失敗しました。もう一度お試しください。');
+  }
+
   function waitForFirebase() {
     return new Promise((resolve) => {
       if (window.__firebase) return resolve(window.__firebase);
@@ -579,7 +589,13 @@
   async function createRoom() {
     lobbyMessage.textContent = '';
     const fb = await waitForFirebase();
-    const code = genRoomCode();
+    let code;
+    try {
+      code = await generateUniqueRoomCode(fb);
+    } catch (e) {
+      lobbyMessage.textContent = e.message;
+      return;
+    }
     const initialState = {
       board: freshBoard(),
       turn: BLACK,
@@ -761,6 +777,14 @@
     resultTitle.textContent = title;
     finalScore.textContent = `黒 ${black} — 白 ${white}`;
     overlay.classList.add('show');
+
+    if (mode === 'online' && roomCode) {
+      const codeToClean = roomCode;
+      setTimeout(async () => {
+        const fb = await waitForFirebase();
+        await fb.remove(fb.ref(fb.db, 'rooms/' + codeToClean));
+      }, 5000);
+    }
   }
 
   function leaveToLobby() {
