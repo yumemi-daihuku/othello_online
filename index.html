@@ -311,6 +311,52 @@
     color: #b6a688;
     letter-spacing: 1px;
   }
+
+  /* スキル関連 */
+  .skill-bar {
+    display: flex;
+    gap: 10px;
+    margin-top: 16px;
+    flex-wrap: wrap;
+    justify-content: center;
+  }
+  .skill-btn {
+    background: linear-gradient(180deg, #7a4fae, #5a3585);
+    color: var(--ivory);
+    font-size: 12px;
+    padding: 9px 16px;
+  }
+  .skill-btn.active {
+    outline: 2px solid var(--brass-bright);
+    outline-offset: 2px;
+  }
+  .skill-btn.used,
+  .skill-btn:disabled {
+    opacity: 0.35;
+    cursor: not-allowed;
+    background: #3a3038;
+    color: #8d7c8e;
+  }
+
+  .cell.hint::before {
+    content: '';
+    position: absolute;
+    width: 68%;
+    height: 68%;
+    border-radius: 50%;
+    border: 3px solid rgba(90, 170, 255, 0.9);
+    box-shadow: 0 0 10px rgba(90, 170, 255, 0.7);
+    pointer-events: none;
+  }
+  .cell.skill-legal::after {
+    content: '';
+    position: absolute;
+    width: 22%;
+    height: 22%;
+    border-radius: 50%;
+    background: rgba(200, 110, 230, 0.65);
+    animation: pulse 1.6s ease-in-out infinite;
+  }
 </style>
 </head>
 <body>
@@ -341,6 +387,28 @@
       <button id="cpuEasyBtn">弱い(ランダム)</button>
       <button id="cpuMediumBtn">中(2手先読み)</button>
       <button id="cpuHardBtn">強い(4手先読み+戦略評価)</button>
+    </div>
+  </div>
+
+  <!-- ローカル対戦モード選択画面 -->
+  <div id="localModeScreen" class="lobby-panel" style="display:none;">
+    <div class="lobby-card">
+      <h2>対戦ルールを選択</h2>
+      <p>ローカル対戦のルールを選んでください。</p>
+      <button id="localNormalBtn">ノーマルモード</button>
+      <button id="localSkillBtn">スキルモード</button>
+      <button class="secondary" id="localModeBackBtn">戻る</button>
+    </div>
+  </div>
+
+  <!-- オンライン対戦モード選択画面 -->
+  <div id="onlineModeScreen" class="lobby-panel" style="display:none;">
+    <div class="lobby-card">
+      <h2>対戦ルールを選択</h2>
+      <p>作成する部屋のルールを選んでください。</p>
+      <button id="onlineNormalBtn">ノーマルモード</button>
+      <button id="onlineSkillBtn">スキルモード</button>
+      <button class="secondary" id="onlineModeBackBtn">戻る</button>
     </div>
   </div>
 
@@ -377,6 +445,12 @@
 
     <div class="message-banner" id="messageBanner">&nbsp;</div>
 
+    <div class="skill-bar" id="skillBar" style="display:none;">
+      <button class="skill-btn" id="skillAssistBtn">CPUアシスト</button>
+      <button class="skill-btn" id="skillOverwriteBtn">重ね置き</button>
+      <button class="skill-btn" id="skillFreeBtn">自由置き</button>
+    </div>
+
     <div class="controls">
       <button id="resetBtn">最初から</button>
       <button class="secondary" id="passBtn" style="display:none;">パス</button>
@@ -409,15 +483,37 @@
   let cpuLevel = null;        // 1 | 2 | 3
   let humanColor = null;
   let cpuColor = null;
+
+  // スキルモード関連
+  let gameSkillMode = 'normal'; // 'normal' | 'skill'
+  let skillsUsed = null;        // { black:{assist,overwrite,free}, white:{...} }
+  let pendingSkill = null;      // null | 'overwrite' | 'free'
+  let hintCell = null;          // { r, c } | null
+
+  function freshSkillsUsed() {
+    return {
+      black: { assist: false, overwrite: false, free: false },
+      white: { assist: false, overwrite: false, free: false }
+    };
+  }
+  function colorKey(color) { return color === BLACK ? 'black' : 'white'; }
   let roomCode = null;
   let roomRef = null;
   let unsubscribe = null;
+  let latestOnlineState = null;
 
   // ---- DOM参照 ----
   const lobbyScreen = document.getElementById('lobbyScreen');
   const waitingScreen = document.getElementById('waitingScreen');
   const gameScreen = document.getElementById('gameScreen');
+  const localModeScreen = document.getElementById('localModeScreen');
+  const onlineModeScreen = document.getElementById('onlineModeScreen');
   const subtitleText = document.getElementById('subtitleText');
+
+  const skillBar = document.getElementById('skillBar');
+  const skillAssistBtn = document.getElementById('skillAssistBtn');
+  const skillOverwriteBtn = document.getElementById('skillOverwriteBtn');
+  const skillFreeBtn = document.getElementById('skillFreeBtn');
 
   const startLocalBtn = document.getElementById('startLocalBtn');
   const cpuEasyBtn = document.getElementById('cpuEasyBtn');
@@ -486,6 +582,52 @@
     return moves;
   }
 
+  // 重ね置き用:セルの現在の内容を無視して方向判定のみ行う
+  function getFlipsIgnoringCell(b, r, c, player) {
+    const opponent = player === BLACK ? WHITE : BLACK;
+    let allFlips = [];
+    for (const [dr, dc] of DIRS) {
+      let rr = r + dr, cc = c + dc;
+      let line = [];
+      while (inBounds(rr, cc) && b[rr][cc] === opponent) {
+        line.push([rr, cc]);
+        rr += dr; cc += dc;
+      }
+      if (line.length > 0 && inBounds(rr, cc) && b[rr][cc] === player) {
+        allFlips = allFlips.concat(line);
+      }
+    }
+    return allFlips;
+  }
+
+  // 重ね置きの合法マス一覧:駒が置かれているマスのみ対象、反転可能な位置のみ
+  function overwriteMoves(b, player) {
+    const moves = [];
+    for (let r = 0; r < SIZE; r++) {
+      for (let c = 0; c < SIZE; c++) {
+        if (b[r][c] !== EMPTY) {
+          const flips = getFlipsIgnoringCell(b, r, c, player);
+          if (flips.length > 0) moves.push({ r, c, flips });
+        }
+      }
+    }
+    return moves;
+  }
+
+  // 自由置きの合法マス一覧:空マスかつ通常では合法手にならないマスのみ対象
+  function freePlaceMoves(b, player) {
+    const moves = [];
+    for (let r = 0; r < SIZE; r++) {
+      for (let c = 0; c < SIZE; c++) {
+        if (b[r][c] === EMPTY) {
+          const flips = getFlips(b, r, c, player);
+          if (flips.length === 0) moves.push({ r, c, flips: [] });
+        }
+      }
+    }
+    return moves;
+  }
+
   function countDiscs(b) {
     let black = 0, white = 0;
     for (let r = 0; r < SIZE; r++)
@@ -504,18 +646,23 @@
   // ---- 画面切り替え ----
   function showScreen(name) {
     lobbyScreen.style.display = name === 'lobby' ? 'flex' : 'none';
+    localModeScreen.style.display = name === 'localMode' ? 'flex' : 'none';
+    onlineModeScreen.style.display = name === 'onlineMode' ? 'flex' : 'none';
     waitingScreen.style.display = name === 'waiting' ? 'flex' : 'none';
     gameScreen.style.display = name === 'game' ? 'block' : 'none';
   }
 
   // ---- ローカル対戦 ----
-  function startLocal() {
+  function startLocal(skillMode) {
     mode = 'local';
     myColor = null;
+    gameSkillMode = skillMode;
     roomBadge.style.display = 'none';
     leaveRoomBtn.style.display = 'inline-block';
     passBtn.onclick = () => {
       switchTurnLocal();
+      pendingSkill = null;
+      hintCell = null;
       renderFromLocalState();
     };
     document.getElementById('resetBtn').onclick = () => initLocalBoard();
@@ -527,6 +674,9 @@
     board = freshBoard();
     currentPlayer = BLACK;
     gameOver = false;
+    skillsUsed = freshSkillsUsed();
+    pendingSkill = null;
+    hintCell = null;
     overlay.classList.remove('show');
     messageBanner.textContent = '\u00A0';
     renderFromLocalState();
@@ -536,43 +686,107 @@
     currentPlayer = currentPlayer === BLACK ? WHITE : BLACK;
   }
 
-  function handleLocalCellClick(r, c, moves) {
+  function handleLocalCellClick(r, c, candidateMoves) {
     if (gameOver) return;
-    const move = moves.find(m => m.r === r && m.c === c);
+    const move = candidateMoves.find(m => m.r === r && m.c === c);
     if (!move) return;
-    applyMove(board, move, currentPlayer);
+
+    if (pendingSkill === 'overwrite') {
+      board[r][c] = currentPlayer;
+      for (const f of move.flips) board[f[0]][f[1]] = currentPlayer;
+      skillsUsed[colorKey(currentPlayer)].overwrite = true;
+    } else if (pendingSkill === 'free') {
+      board[r][c] = currentPlayer;
+    } else {
+      applyMove(board, move, currentPlayer);
+    }
+    pendingSkill = null;
+    hintCell = null;
     renderFromLocalState(move);
+
     setTimeout(() => {
       switchTurnLocal();
       renderFromLocalState();
     }, 480);
   }
 
+  function useSkillAssist() {
+    if (gameOver || pendingSkill) return;
+    const key = colorKey(currentPlayer);
+    if (skillsUsed[key].assist) return;
+    const moves = legalMoves(board, currentPlayer);
+    if (moves.length === 0) return;
+    const best = chooseCPUMove(board, currentPlayer, 3, moves);
+    hintCell = { r: best.r, c: best.c };
+    skillsUsed[key].assist = true;
+    renderFromLocalState();
+  }
+
+  function toggleSkillOverwrite() {
+    if (gameOver) return;
+    const key = colorKey(currentPlayer);
+    if (skillsUsed[key].overwrite) return;
+    pendingSkill = pendingSkill === 'overwrite' ? null : 'overwrite';
+    renderFromLocalState();
+  }
+
+  function toggleSkillFree() {
+    if (gameOver) return;
+    const key = colorKey(currentPlayer);
+    if (skillsUsed[key].free) return;
+    pendingSkill = pendingSkill === 'free' ? null : 'free';
+    renderFromLocalState();
+  }
+
   function renderFromLocalState(lastMove) {
     checkLocalPass();
+    const normalMoves = gameOver ? [] : legalMoves(board, currentPlayer);
+    let candidateMoves = normalMoves;
+    let useSkillHighlight = false;
+    if (!gameOver && pendingSkill === 'overwrite') {
+      candidateMoves = overwriteMoves(board, currentPlayer);
+      useSkillHighlight = true;
+    } else if (!gameOver && pendingSkill === 'free') {
+      candidateMoves = freePlaceMoves(board, currentPlayer);
+      useSkillHighlight = true;
+    }
     renderBoard({
       board, currentPlayer, gameOver,
-      moves: gameOver ? [] : legalMoves(board, currentPlayer),
+      moves: candidateMoves,
       lastMove,
       onCellClick: handleLocalCellClick,
-      interactive: true
+      interactive: true,
+      skillHighlight: useSkillHighlight,
+      hintCell
     });
+    updateSkillBar(currentPlayer);
   }
 
   function checkLocalPass() {
     if (gameOver) return;
     const moves = legalMoves(board, currentPlayer);
-    if (moves.length === 0) {
-      const opponent = currentPlayer === BLACK ? WHITE : BLACK;
-      if (legalMoves(board, opponent).length === 0) {
-        endGame(board);
-      } else {
-        passBtn.style.display = 'inline-block';
-        messageBanner.textContent = (currentPlayer === BLACK ? '黒' : '白') + 'は合法手がないためパスです';
-      }
-    } else {
+    if (moves.length > 0) {
       passBtn.style.display = 'none';
       messageBanner.textContent = '\u00A0';
+      return;
+    }
+    // 通常の合法手がなくてもスキルで代替できるか確認
+    if (gameSkillMode === 'skill' && skillsUsed) {
+      const used = skillsUsed[colorKey(currentPlayer)];
+      const canOverwrite = !used.overwrite && overwriteMoves(board, currentPlayer).length > 0;
+      const canFree = !used.free && freePlaceMoves(board, currentPlayer).length > 0;
+      if (canOverwrite || canFree) {
+        passBtn.style.display = 'inline-block';
+        messageBanner.textContent = '通常の合法手がありません。スキルを使うか、パスしてください。';
+        return;
+      }
+    }
+    const opponent = currentPlayer === BLACK ? WHITE : BLACK;
+    if (legalMoves(board, opponent).length === 0) {
+      endGame(board);
+    } else {
+      passBtn.style.display = 'inline-block';
+      messageBanner.textContent = (currentPlayer === BLACK ? '黒' : '白') + 'は合法手がないためパスです';
     }
   }
 
@@ -693,6 +907,11 @@
     humanColor = BLACK;
     cpuColor = WHITE;
     myColor = null;
+    gameSkillMode = 'normal';
+    skillsUsed = null;
+    pendingSkill = null;
+    hintCell = null;
+    skillBar.style.display = 'none';
     roomBadge.style.display = 'none';
     leaveRoomBtn.style.display = 'inline-block';
     passBtn.style.display = 'none';
@@ -805,7 +1024,7 @@
     });
   }
 
-  async function createRoom() {
+  async function createRoom(skillMode) {
     lobbyMessage.textContent = '';
     const fb = await waitForFirebase();
     let code;
@@ -819,6 +1038,8 @@
       board: freshBoard(),
       turn: BLACK,
       status: 'waiting',
+      gameMode: skillMode,
+      skillsUsed: freshSkillsUsed(),
       players: { black: true, white: false },
       lastMove: null,
       createdAt: fb.serverTimestamp()
@@ -832,7 +1053,7 @@
     // 相手が入室したらゲーム開始
     listenRoom(code, (state) => {
       if (state && state.status === 'playing' && waitingScreen.style.display !== 'none') {
-        enterOnlineGame(code, BLACK);
+        enterOnlineGame(code, BLACK, state.gameMode);
       }
     });
 
@@ -863,7 +1084,7 @@
       status: 'playing'
     });
     fb.onDisconnect(fb.ref(fb.db, 'rooms/' + code + '/players/white')).set(false);
-    enterOnlineGame(code, WHITE);
+    enterOnlineGame(code, WHITE, state.gameMode);
   }
 
   function listenRoom(code, onUpdate) {
@@ -878,10 +1099,13 @@
     });
   }
 
-  function enterOnlineGame(code, color) {
+  function enterOnlineGame(code, color, skillMode) {
     mode = 'online';
     roomCode = code;
     myColor = color;
+    gameSkillMode = skillMode || 'normal';
+    pendingSkill = null;
+    hintCell = null;
     roomBadge.style.display = 'inline';
     roomBadge.textContent = 'ルーム ' + code + ' / あなたは' + (color === BLACK ? '黒' : '白');
     leaveRoomBtn.style.display = 'inline-block';
@@ -904,28 +1128,72 @@
     await fb.update(fb.ref(fb.db, 'rooms/' + roomCode), { turn: nextTurn });
   }
 
-  async function handleOnlineCellClick(r, c, moves, state) {
+  async function handleOnlineCellClick(r, c, candidateMoves, state) {
     if (state.turn !== myColor) return; // 自分の番でない
-    const move = moves.find(m => m.r === r && m.c === c);
+    const move = candidateMoves.find(m => m.r === r && m.c === c);
     if (!move) return;
 
     const newBoard = state.board.map(row => row.slice());
-    applyMove(newBoard, move, myColor);
     const nextTurn = myColor === BLACK ? WHITE : BLACK;
-
-    const fb = await waitForFirebase();
-    await fb.update(fb.ref(fb.db, 'rooms/' + roomCode), {
-      board: newBoard,
+    const key = colorKey(myColor);
+    const updates = {
       turn: nextTurn,
       lastMove: { r: move.r, c: move.c, flips: move.flips }
+    };
+
+    if (pendingSkill === 'overwrite') {
+      newBoard[r][c] = myColor;
+      for (const f of move.flips) newBoard[f[0]][f[1]] = myColor;
+      updates['skillsUsed/' + key + '/overwrite'] = true;
+    } else if (pendingSkill === 'free') {
+      newBoard[r][c] = myColor;
+    } else {
+      applyMove(newBoard, move, myColor);
+    }
+    updates.board = newBoard;
+    pendingSkill = null;
+    hintCell = null;
+
+    const fb = await waitForFirebase();
+    await fb.update(fb.ref(fb.db, 'rooms/' + roomCode), updates);
+  }
+
+  async function useOnlineSkillAssist(state) {
+    if (state.turn !== myColor) return;
+    const key = colorKey(myColor);
+    if (state.skillsUsed && state.skillsUsed[key] && state.skillsUsed[key].assist) return;
+    const moves = legalMoves(state.board, myColor);
+    if (moves.length === 0) return;
+    const best = chooseCPUMove(state.board, myColor, 3, moves);
+    hintCell = { r: best.r, c: best.c };
+    const fb = await waitForFirebase();
+    await fb.update(fb.ref(fb.db, 'rooms/' + roomCode), {
+      ['skillsUsed/' + key + '/assist']: true
     });
+    renderFromOnlineState(state);
+  }
+
+  function toggleOnlineSkillOverwrite(state) {
+    if (state.turn !== myColor) return;
+    const key = colorKey(myColor);
+    if (state.skillsUsed && state.skillsUsed[key] && state.skillsUsed[key].overwrite) return;
+    pendingSkill = pendingSkill === 'overwrite' ? null : 'overwrite';
+    renderFromOnlineState(state);
+  }
+
+  function toggleOnlineSkillFree(state) {
+    if (state.turn !== myColor) return;
+    const key = colorKey(myColor);
+    if (state.skillsUsed && state.skillsUsed[key] && state.skillsUsed[key].free) return;
+    pendingSkill = pendingSkill === 'free' ? null : 'free';
+    renderFromOnlineState(state);
   }
 
   function renderFromOnlineState(state) {
+    latestOnlineState = state;
     board = state.board;
     currentPlayer = state.turn;
     const moves = legalMoves(board, currentPlayer);
-    const { black, white } = countDiscs(board);
     gameOver = false;
 
     // 相手の離脱チェック
@@ -933,6 +1201,7 @@
     const opponentPresent = state.players && state.players[opponentColor];
     if (!opponentPresent && !gameOver) {
       passBtn.style.display = 'none';
+      skillBar.style.display = 'none';
       messageBanner.textContent = '相手が対局から離脱しました。ロビーに戻ってください。';
       renderBoard({
         board, currentPlayer, gameOver: true,
@@ -944,31 +1213,78 @@
       return;
     }
 
+    const isMyTurn = currentPlayer === myColor;
+    let candidateMoves = moves;
+    let useSkillHighlight = false;
+    if (isMyTurn && pendingSkill === 'overwrite') {
+      candidateMoves = overwriteMoves(board, currentPlayer);
+      useSkillHighlight = true;
+    } else if (isMyTurn && pendingSkill === 'free') {
+      candidateMoves = freePlaceMoves(board, currentPlayer);
+      useSkillHighlight = true;
+    }
+
     if (moves.length === 0) {
-      const opponent = currentPlayer === BLACK ? WHITE : BLACK;
-      if (legalMoves(board, opponent).length === 0) {
-        gameOver = true;
-        endGame(board);
+      let skillAlternative = false;
+      if (gameSkillMode === 'skill' && state.skillsUsed) {
+        const used = state.skillsUsed[colorKey(currentPlayer)] || { overwrite: false, free: false };
+        const canOverwrite = !used.overwrite && overwriteMoves(board, currentPlayer).length > 0;
+        const canFree = !used.free && freePlaceMoves(board, currentPlayer).length > 0;
+        skillAlternative = canOverwrite || canFree;
+      }
+      if (skillAlternative) {
+        passBtn.style.display = isMyTurn ? 'inline-block' : 'none';
+        messageBanner.textContent = isMyTurn
+          ? '通常の合法手がありません。スキルを使うか、パスしてください。'
+          : '相手の番です(スキル使用可能)';
       } else {
-        passBtn.style.display = (myColor === currentPlayer) ? 'inline-block' : 'none';
-        messageBanner.textContent = (currentPlayer === BLACK ? '黒' : '白') + 'は合法手がないためパスです';
+        const opponent = currentPlayer === BLACK ? WHITE : BLACK;
+        if (legalMoves(board, opponent).length === 0) {
+          gameOver = true;
+          endGame(board);
+        } else {
+          passBtn.style.display = isMyTurn ? 'inline-block' : 'none';
+          messageBanner.textContent = (currentPlayer === BLACK ? '黒' : '白') + 'は合法手がないためパスです';
+        }
       }
     } else {
       passBtn.style.display = 'none';
-      messageBanner.textContent = (currentPlayer === myColor) ? 'あなたの番です' : '相手の番です';
+      messageBanner.textContent = isMyTurn ? 'あなたの番です' : '相手の番です';
     }
 
     renderBoard({
       board, currentPlayer, gameOver,
-      moves: (!gameOver && currentPlayer === myColor) ? moves : [],
+      moves: (!gameOver && isMyTurn) ? candidateMoves : [],
       lastMove: state.lastMove,
       onCellClick: (r, c, mvs) => handleOnlineCellClick(r, c, mvs, state),
-      interactive: currentPlayer === myColor
+      interactive: !gameOver && isMyTurn,
+      skillHighlight: useSkillHighlight,
+      hintCell: isMyTurn ? hintCell : null
     });
+
+    updateOnlineSkillBar(state, isMyTurn);
+  }
+
+  function updateOnlineSkillBar(state, isMyTurn) {
+    if (gameSkillMode !== 'skill') {
+      skillBar.style.display = 'none';
+      return;
+    }
+    skillBar.style.display = 'flex';
+    const used = (state.skillsUsed && state.skillsUsed[colorKey(myColor)]) || { assist: false, overwrite: false, free: false };
+    const disabledBase = !isMyTurn || gameOver;
+    skillAssistBtn.disabled = disabledBase || used.assist;
+    skillOverwriteBtn.disabled = disabledBase || used.overwrite;
+    skillFreeBtn.disabled = disabledBase || used.free;
+    skillOverwriteBtn.classList.toggle('active', pendingSkill === 'overwrite');
+    skillFreeBtn.classList.toggle('active', pendingSkill === 'free');
+    skillAssistBtn.classList.toggle('used', used.assist);
+    skillOverwriteBtn.classList.toggle('used', used.overwrite);
+    skillFreeBtn.classList.toggle('used', used.free);
   }
 
   // ---- 共通レンダリング ----
-  function renderBoard({ board: b, currentPlayer: cp, gameOver: go, moves, lastMove, onCellClick, interactive }) {
+  function renderBoard({ board: b, currentPlayer: cp, gameOver: go, moves, lastMove, onCellClick, interactive, skillHighlight, hintCell: hint }) {
     const { black, white } = countDiscs(b);
     blackScoreEl.textContent = black;
     whiteScoreEl.textContent = white;
@@ -980,8 +1296,9 @@
       for (let c = 0; c < SIZE; c++) {
         const cell = document.createElement('div');
         cell.className = 'cell';
-        const isLegal = moves.some(m => m.r === r && m.c === c);
-        if (isLegal) cell.classList.add('legal');
+        const isCandidate = moves.some(m => m.r === r && m.c === c);
+        if (isCandidate) cell.classList.add(skillHighlight ? 'skill-legal' : 'legal');
+        if (hint && hint.r === r && hint.c === c) cell.classList.add('hint');
 
         if (b[r][c] !== EMPTY) {
           const disc = document.createElement('div');
@@ -1000,6 +1317,23 @@
         boardEl.appendChild(cell);
       }
     }
+  }
+
+  function updateSkillBar(activeColor) {
+    if (gameSkillMode !== 'skill' || !skillsUsed) {
+      skillBar.style.display = 'none';
+      return;
+    }
+    skillBar.style.display = 'flex';
+    const used = skillsUsed[colorKey(activeColor)];
+    skillAssistBtn.disabled = used.assist || gameOver;
+    skillOverwriteBtn.disabled = used.overwrite || gameOver;
+    skillFreeBtn.disabled = used.free || gameOver;
+    skillOverwriteBtn.classList.toggle('active', pendingSkill === 'overwrite');
+    skillFreeBtn.classList.toggle('active', pendingSkill === 'free');
+    skillAssistBtn.classList.toggle('used', used.assist);
+    skillOverwriteBtn.classList.toggle('used', used.overwrite);
+    skillFreeBtn.classList.toggle('used', used.free);
   }
 
   function endGame(b) {
@@ -1032,6 +1366,12 @@
     mode = null;
     myColor = null;
     roomCode = null;
+    gameSkillMode = 'normal';
+    skillsUsed = null;
+    pendingSkill = null;
+    hintCell = null;
+    latestOnlineState = null;
+    skillBar.style.display = 'none';
     overlay.classList.remove('show');
     document.getElementById('resetBtn').style.display = 'inline-block';
     joinCodeInput.value = '';
@@ -1050,14 +1390,36 @@
   }
 
   // ---- イベント登録 ----
-  startLocalBtn.addEventListener('click', startLocal);
+  startLocalBtn.addEventListener('click', () => showScreen('localMode'));
+  document.getElementById('localNormalBtn').addEventListener('click', () => startLocal('normal'));
+  document.getElementById('localSkillBtn').addEventListener('click', () => startLocal('skill'));
+  document.getElementById('localModeBackBtn').addEventListener('click', () => showScreen('lobby'));
+
   cpuEasyBtn.addEventListener('click', () => startCPU(1));
   cpuMediumBtn.addEventListener('click', () => startCPU(2));
   cpuHardBtn.addEventListener('click', () => startCPU(3));
-  createRoomBtn.addEventListener('click', createRoom);
+
+  createRoomBtn.addEventListener('click', () => showScreen('onlineMode'));
+  document.getElementById('onlineNormalBtn').addEventListener('click', () => createRoom('normal'));
+  document.getElementById('onlineSkillBtn').addEventListener('click', () => createRoom('skill'));
+  document.getElementById('onlineModeBackBtn').addEventListener('click', () => showScreen('lobby'));
+
   joinRoomBtn.addEventListener('click', joinRoom);
   cancelRoomBtn.addEventListener('click', cancelRoom);
   leaveRoomBtn.addEventListener('click', leaveToLobby);
+
+  skillAssistBtn.addEventListener('click', () => {
+    if (mode === 'local') useSkillAssist();
+    else if (mode === 'online' && latestOnlineState) useOnlineSkillAssist(latestOnlineState);
+  });
+  skillOverwriteBtn.addEventListener('click', () => {
+    if (mode === 'local') toggleSkillOverwrite();
+    else if (mode === 'online' && latestOnlineState) toggleOnlineSkillOverwrite(latestOnlineState);
+  });
+  skillFreeBtn.addEventListener('click', () => {
+    if (mode === 'local') toggleSkillFree();
+    else if (mode === 'online' && latestOnlineState) toggleOnlineSkillFree(latestOnlineState);
+  });
   document.getElementById('playAgainBtn').addEventListener('click', () => {
     if (mode === 'local') { initLocalBoard(); }
     else if (mode === 'cpu') { initCPUBoard(); }
