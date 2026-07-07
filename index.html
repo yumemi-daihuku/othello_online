@@ -697,6 +697,7 @@
       skillsUsed[colorKey(currentPlayer)].overwrite = true;
     } else if (pendingSkill === 'free') {
       board[r][c] = currentPlayer;
+      skillsUsed[colorKey(currentPlayer)].free = true;
     } else {
       applyMove(board, move, currentPlayer);
     }
@@ -1147,6 +1148,7 @@
       updates['skillsUsed/' + key + '/overwrite'] = true;
     } else if (pendingSkill === 'free') {
       newBoard[r][c] = myColor;
+      updates['skillsUsed/' + key + '/free'] = true;
     } else {
       applyMove(newBoard, move, myColor);
     }
