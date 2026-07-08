@@ -378,6 +378,7 @@
       <div class="join-row">
         <input id="joinCodeInput" maxlength="6" placeholder="6桁のコード" inputmode="numeric">
         <button id="joinRoomBtn">コードで参加(白)</button>
+        <button class="secondary" id="watchRoomBtn">コードで観戦する</button>
       </div>
       <div id="lobbyMessage" class="lobby-message"></div>
     </div>
@@ -501,6 +502,7 @@
   let roomRef = null;
   let unsubscribe = null;
   let latestOnlineState = null;
+  let spectatorId = null;
 
   // ---- DOM参照 ----
   const lobbyScreen = document.getElementById('lobbyScreen');
@@ -521,6 +523,7 @@
   const cpuHardBtn = document.getElementById('cpuHardBtn');
   const createRoomBtn = document.getElementById('createRoomBtn');
   const joinRoomBtn = document.getElementById('joinRoomBtn');
+  const watchRoomBtn = document.getElementById('watchRoomBtn');
   const joinCodeInput = document.getElementById('joinCodeInput');
   const lobbyMessage = document.getElementById('lobbyMessage');
   const roomCodeDisplay = document.getElementById('roomCodeDisplay');
@@ -1100,6 +1103,87 @@
     });
   }
 
+  // ---- 観戦 ----
+  function genSpectatorId() {
+    return 'spec_' + Math.random().toString(36).slice(2, 10);
+  }
+
+  async function watchRoom() {
+    lobbyMessage.textContent = '';
+    const code = joinCodeInput.value.trim();
+    if (!/^\d{6}$/.test(code)) {
+      lobbyMessage.textContent = '6桁の数字でコードを入力してください';
+      return;
+    }
+    const fb = await waitForFirebase();
+    const snap = await fb.get(fb.ref(fb.db, 'rooms/' + code));
+    if (!snap.exists()) {
+      lobbyMessage.textContent = 'その部屋は見つかりません';
+      return;
+    }
+    const state = snap.val();
+    const id = genSpectatorId();
+    await fb.set(fb.ref(fb.db, 'rooms/' + code + '/spectators/' + id), true);
+    fb.onDisconnect(fb.ref(fb.db, 'rooms/' + code + '/spectators/' + id)).remove();
+    enterSpectatorMode(code, id, state.gameMode);
+  }
+
+  function enterSpectatorMode(code, id, skillMode) {
+    mode = 'spectator';
+    roomCode = code;
+    spectatorId = id;
+    myColor = null;
+    gameSkillMode = skillMode || 'normal';
+    pendingSkill = null;
+    hintCell = null;
+    roomBadge.style.display = 'inline';
+    leaveRoomBtn.style.display = 'inline-block';
+    passBtn.style.display = 'none';
+    skillBar.style.display = 'none';
+    document.getElementById('resetBtn').style.display = 'none';
+    showScreen('game');
+
+    listenRoom(code, (state) => {
+      renderSpectatorState(state);
+    });
+  }
+
+  function renderSpectatorState(state) {
+    if (!state) {
+      roomBadge.textContent = '観戦中(この部屋は終了しました)';
+      messageBanner.textContent = '対局が終了したため、この部屋は閉じられました。';
+      passBtn.style.display = 'none';
+      return;
+    }
+    latestOnlineState = state;
+    board = state.board;
+    currentPlayer = state.turn;
+    const moves = legalMoves(board, currentPlayer);
+    const specCount = state.spectators ? Object.keys(state.spectators).length : 0;
+    roomBadge.textContent = '観戦中 / ルーム ' + roomCode + '(観戦者 ' + specCount + '人)';
+
+    let terminal = false;
+    if (moves.length === 0) {
+      const opponent = currentPlayer === BLACK ? WHITE : BLACK;
+      if (legalMoves(board, opponent).length === 0) {
+        terminal = true;
+        endGame(board);
+      } else {
+        messageBanner.textContent = (currentPlayer === BLACK ? '黒' : '白') + 'は合法手がないためパスです';
+      }
+    } else {
+      messageBanner.textContent = (currentPlayer === BLACK ? '黒' : '白') + 'の番です(観戦中)';
+    }
+
+    renderBoard({
+      board, currentPlayer, gameOver: terminal,
+      moves: terminal ? [] : moves,
+      lastMove: state.lastMove,
+      onCellClick: () => {},
+      interactive: false
+    });
+  }
+
   function enterOnlineGame(code, color, skillMode) {
     mode = 'online';
     roomCode = code;
@@ -1108,7 +1192,6 @@
     pendingSkill = null;
     hintCell = null;
     roomBadge.style.display = 'inline';
-    roomBadge.textContent = 'ルーム ' + code + ' / あなたは' + (color === BLACK ? '黒' : '白');
     leaveRoomBtn.style.display = 'inline-block';
     document.getElementById('resetBtn').style.display = 'none'; // オンラインでは片方が勝手にリセットしない
     passBtn.onclick = onlinePass;
@@ -1195,6 +1278,9 @@
     latestOnlineState = state;
     board = state.board;
     currentPlayer = state.turn;
+    const specCount = state.spectators ? Object.keys(state.spectators).length : 0;
+    roomBadge.textContent = 'ルーム ' + roomCode + ' / あなたは' + (myColor === BLACK ? '黒' : '白') +
+      (specCount > 0 ? ' / 観戦者 ' + specCount + '人' : '');
     const moves = legalMoves(board, currentPlayer);
     gameOver = false;
 
@@ -1364,10 +1450,15 @@
       const myKey = myColor === BLACK ? 'black' : 'white';
       fb.set(fb.ref(fb.db, 'rooms/' + roomCode + '/players/' + myKey), false).catch(() => {});
     }
+    if (mode === 'spectator' && roomCode && spectatorId) {
+      const fb = await waitForFirebase();
+      fb.remove(fb.ref(fb.db, 'rooms/' + roomCode + '/spectators/' + spectatorId)).catch(() => {});
+    }
     if (unsubscribe) { unsubscribe(); unsubscribe = null; }
     mode = null;
     myColor = null;
     roomCode = null;
+    spectatorId = null;
     gameSkillMode = 'normal';
     skillsUsed = null;
     pendingSkill = null;
@@ -1407,6 +1498,7 @@
   document.getElementById('onlineModeBackBtn').addEventListener('click', () => showScreen('lobby'));
 
   joinRoomBtn.addEventListener('click', joinRoom);
+  watchRoomBtn.addEventListener('click', watchRoom);
   cancelRoomBtn.addEventListener('click', cancelRoom);
   leaveRoomBtn.addEventListener('click', leaveToLobby);
 
